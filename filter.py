@@ -1,14 +1,23 @@
 # rss_filter_proxy.py
-import os
 import re
 import http.server
 import socketserver
-import feedparser
 import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import Element, SubElement
 from email.utils import formatdate
 import time
 from dotenv import load_dotenv
+import logging
+import os
+import sys
+import feedparser
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(message)s",
+    stream=sys.stdout,
+)
+log = logging.getLogger("reddit-rss-filter")
 
 load_dotenv()
 
@@ -97,16 +106,49 @@ def build_filtered_rss(original_feed):
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
-        feed = feedparser.parse(FEED_URL)
-        data = build_filtered_rss(feed)
+        log.info("Request from %s: %s", self.client_address[0], self.path)
 
-        self.send_response(200)
-        self.send_header("Content-Type", "application/rss+xml; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            feed = feedparser.parse(FEED_URL)
 
-    def log_message(self, format, *args):
-        pass
+            if getattr(feed, "bozo", False):
+                log.warning("Feed parse warning: %s", feed.bozo_exception)
+
+            kept = []
+            skipped = 0
+
+            for entry in feed.entries:
+                title = entry.get("title", "")
+                if matches_filters(title):
+                    kept.append(entry)
+                    log.info("KEEP: %s", title)
+                else:
+                    skipped += 1
+                    log.debug("SKIP: %s", title)
+
+            # Keep the original feed metadata while building the filtered RSS.
+            feed.entries = kept
+            data = build_filtered_rss(feed)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "application/rss+xml; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+            log.info(
+                "Served %d entries; skipped %d; feed status=%s",
+                len(kept),
+                skipped,
+                getattr(feed, "status", "unknown"),
+            )
+
+        except Exception:
+            log.exception("Failed to fetch or serve feed")
+            self.send_error(502, "Could not fetch or process upstream feed")
+
+    def log_message(self, fmt, *args):
+        log.info("HTTP %s - %s", self.client_address[0], fmt % args)
 
 if __name__ == "__main__":
     if not FEED_URL:
